@@ -2,12 +2,14 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import * as http from "http";
 
 import * as os from "os";
 import * as fs from "fs";
@@ -214,22 +216,27 @@ async function initialize(): Promise<void> {
   }
 }
 
-const server = new Server(
-  {
-    name: "yt-dlp-mcp",
-    version: VERSION,
-  },
-  {
-    capabilities: {
-      tools: {}
-    },
-  }
-);
-
 /**
- * Returns the list of available tools.
+ * Creates and configures a new MCP Server instance with all tool handlers.
+ * Called once for stdio and once per HTTP SSE session.
  */
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+function createMcpServer(): Server {
+  const srv = new Server(
+    {
+      name: "yt-dlp-mcp",
+      version: VERSION,
+    },
+    {
+      capabilities: {
+        tools: {}
+      },
+    }
+  );
+
+  /**
+   * Returns the list of available tools.
+   */
+  srv.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
@@ -572,36 +579,36 @@ Error Handling:
   };
 });
 
-/**
- * Handle tool execution with unified error handling
- * @param action Async operation to execute
- * @param errorPrefix Error message prefix
- */
-async function handleToolExecution<T>(
-  action: () => Promise<T>,
-  errorPrefix: string
-): Promise<{
-  content: Array<{ type: "text", text: string }>,
-  isError?: boolean
-}> {
-  try {
-    const result = await action();
-    return {
-      content: [{ type: "text", text: String(result) }]
-    };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: `${errorPrefix}: ${errorMessage}` }],
-      isError: true
-    };
+  /**
+   * Handle tool execution with unified error handling
+   * @param action Async operation to execute
+   * @param errorPrefix Error message prefix
+   */
+  async function handleToolExecution<T>(
+    action: () => Promise<T>,
+    errorPrefix: string
+  ): Promise<{
+    content: Array<{ type: "text", text: string }>,
+    isError?: boolean
+  }> {
+    try {
+      const result = await action();
+      return {
+        content: [{ type: "text", text: String(result) }]
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text", text: `${errorPrefix}: ${errorMessage}` }],
+        isError: true
+      };
+    }
   }
-}
 
-/**
- * Handles tool execution requests.
- */
-server.setRequestHandler(
+  /**
+   * Handles tool execution requests.
+   */
+  srv.setRequestHandler(
   CallToolRequestSchema,
   async (request: CallToolRequest) => {
     const toolName = request.params.name;
@@ -705,15 +712,99 @@ server.setRequestHandler(
       throw error;
     }
   }
-);
+  );
+
+  return srv;
+}
 
 /**
- * Starts the server using Stdio transport.
+ * Starts the HTTP server, exposing the MCP server over SSE transport.
+ * Listens on PORT env var (default 3000).
  */
-async function startServer() {
-  await initialize();
+async function startHttpServer(): Promise<void> {
+  const port = parseInt(process.env.PORT ?? "3000", 10);
+
+  // Track active SSE transports keyed by session ID so POST /messages
+  // can route incoming client messages to the correct transport instance.
+  const transports = new Map<string, SSEServerTransport>();
+
+  const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", `http://localhost:${port}`);
+    const pathname = url.pathname;
+
+    // Health-check / discovery endpoint
+    if (req.method === "GET" && (pathname === "/" || pathname === "/health")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        name: "yt-dlp-mcp",
+        version: VERSION,
+        transport: "sse",
+        endpoints: { sse: "/sse", messages: "/messages" }
+      }));
+      return;
+    }
+
+    // SSE endpoint — client connects here to receive server messages
+    if (req.method === "GET" && (pathname === "/sse" || pathname === "/mcp")) {
+      const transport = new SSEServerTransport("/messages", res);
+      const sessionId = transport.sessionId;
+      transports.set(sessionId, transport);
+
+      transport.onclose = () => {
+        transports.delete(sessionId);
+      };
+
+      // Each SSE connection gets its own fully-configured Server instance
+      const sessionServer = createMcpServer();
+      await sessionServer.connect(transport);
+      return;
+    }
+
+    // Messages endpoint — client POSTs JSON-RPC messages here
+    if (req.method === "POST" && (pathname === "/messages" || pathname === "/mcp")) {
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      const transport = transports.get(sessionId);
+
+      if (!transport) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unknown or expired session" }));
+        return;
+      }
+
+      await transport.handlePostMessage(req, res);
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  httpServer.listen(port, () => {
+    console.error(`yt-dlp-mcp HTTP server listening on port ${port}`);
+    console.error(`  SSE endpoint:      http://localhost:${port}/sse`);
+    console.error(`  Messages endpoint: http://localhost:${port}/messages`);
+    console.error(`  Health check:      http://localhost:${port}/health`);
+  });
+}
+
+/**
+ * Starts the server using Stdio transport (for local MCP clients).
+ */
+async function startStdioServer(): Promise<void> {
+  const stdioServer = createMcpServer();
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await stdioServer.connect(transport);
+}
+
+/**
+ * Main entry point — starts both HTTP and stdio transports simultaneously.
+ */
+async function startServer(): Promise<void> {
+  await initialize();
+  // Start HTTP server for remote clients (e.g. Grok)
+  await startHttpServer();
+  // Start stdio transport for local MCP clients (Claude, Cursor, Dive)
+  await startStdioServer();
 }
 
 // Start the server and handle potential errors
