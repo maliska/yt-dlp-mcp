@@ -20,4 +20,6 @@ RUN npm run prepare
 
 RUN mkdir -p /root/Downloads
 
+EXPOSE 3000
+
 ENTRYPOINT ["node", "lib/index.mjs"]
