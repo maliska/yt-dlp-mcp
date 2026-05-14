@@ -18,4 +18,6 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npm run prepare
 
+RUN mkdir -p /root/Downloads
+
 ENTRYPOINT ["node", "lib/index.mjs"]
